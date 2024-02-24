@@ -38,7 +38,7 @@ import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-
+import java.util.concurrent.ConcurrentHashMap;
 import java.io.File;
 import java.io.IOException;
 import java.time.LocalDateTime;
@@ -46,6 +46,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.IntStream;
 
 public class IslandManager extends TeamManager<Island, User> {
 
@@ -463,6 +464,7 @@ public class IslandManager extends TeamManager<Island, User> {
     public CompletableFuture<Void> recalculateTeam(Island island) {
         Map<XMaterial, Integer> teamBlocks = new HashMap<>();
         Map<EntityType, Integer> teamSpawners = new HashMap<>();
+
         return CompletableFuture.runAsync(() -> {
             List<Chunk> chunks = getIslandChunks(island).join();
             for (Chunk chunk : chunks) {
@@ -471,16 +473,23 @@ public class IslandManager extends TeamManager<Island, User> {
                     for (int z = 0; z < 16; z++) {
                         final int maxy = chunkSnapshot.getHighestBlockYAt(x, z);
                         for (int y = 0; y <= maxy; y++) {
-                            if (island.isInIsland(x + (chunkSnapshot.getX() * 16), z + (chunkSnapshot.getZ() * 16))) {
+                            int realX = x + (chunkSnapshot.getX() * 16);
+                            int realZ = z + (chunkSnapshot.getZ() * 16);
+                            if (island.isInIsland(realX, realZ)) {
                                 XMaterial material = XMaterial.matchXMaterial(chunkSnapshot.getBlockType(x, y, z));
-                                teamBlocks.put(material, teamBlocks.getOrDefault(material, 0) + 1);
+                                teamBlocks.merge(material, 1, Integer::sum);
                             }
                         }
                     }
                 }
-                getSpawners(chunk, island).join().forEach(creatureSpawner ->
-                        teamSpawners.put(creatureSpawner.getSpawnedType(), teamSpawners.getOrDefault(creatureSpawner.getSpawnedType(), 0) + 1)
-                );
+                for (BlockState blockState : chunk.getTileEntities()) {
+                    if (blockState instanceof CreatureSpawner) {
+                        CreatureSpawner spawner = (CreatureSpawner) blockState;
+                        if (island.isInIsland(spawner.getLocation())) {
+                            teamSpawners.merge(spawner.getSpawnedType(), 1, Integer::sum);
+                        }
+                    }
+                }
             }
         }).thenRun(() -> Bukkit.getScheduler().runTask(IridiumSkyblock.getInstance(), () -> {
             List<TeamBlock> blocks = IridiumSkyblock.getInstance().getDatabaseManager().getTeamBlockTableManager().getEntries(island);
@@ -563,21 +572,27 @@ public class IslandManager extends TeamManager<Island, User> {
     }
 
     @Override
-    public synchronized TeamMission getTeamMission(Island island, String missionName) {
-        Mission mission = IridiumSkyblock.getInstance().getMissions().missions.get(missionName);
-        LocalDateTime localDateTime = IridiumSkyblock.getInstance().getMissionManager().getExpirationTime(mission == null ? MissionType.ONCE : mission.getMissionType(), LocalDateTime.now());
+    public TeamMission getTeamMission(Island island, String missionName) {
+        IridiumSkyblock iridiumSkyblock = IridiumSkyblock.getInstance();
+        Mission mission = iridiumSkyblock.getMissions().missions.get(missionName);
+        LocalDateTime localDateTime = iridiumSkyblock.getMissionManager().getExpirationTime(mission == null ? MissionType.ONCE : mission.getMissionType(), LocalDateTime.now());
 
         TeamMission newTeamMission = new TeamMission(island, missionName, localDateTime);
-        Optional<TeamMission> teamMission = IridiumSkyblock.getInstance().getDatabaseManager().getTeamMissionTableManager().getEntry(newTeamMission);
-        if (teamMission.isPresent()) {
-            return teamMission.get();
-        } else {
-            //TODO need to consider reworking this, it could generate some lag
-            IridiumSkyblock.getInstance().getDatabaseManager().getTeamMissionTableManager().save(newTeamMission);
-            IridiumSkyblock.getInstance().getDatabaseManager().getTeamMissionTableManager().addEntry(newTeamMission);
-            return newTeamMission;
-        }
+
+        return iridiumSkyblock.getDatabaseManager().getTeamMissionTableManager().getEntry(newTeamMission).orElseGet(() -> {
+            synchronized (this) {
+                Optional<TeamMission> existingMission = iridiumSkyblock.getDatabaseManager().getTeamMissionTableManager().getEntry(newTeamMission);
+                if (existingMission.isPresent()) {
+                    return existingMission.get();
+                } else {
+                    iridiumSkyblock.getDatabaseManager().getTeamMissionTableManager().save(newTeamMission);
+                    iridiumSkyblock.getDatabaseManager().getTeamMissionTableManager().addEntry(newTeamMission);
+                    return newTeamMission;
+                }
+            }
+        });
     }
+
 
     @Override
     public synchronized TeamMissionData getTeamMissionData(TeamMission teamMission, int missionIndex) {
